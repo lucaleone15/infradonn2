@@ -1,13 +1,6 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { onMounted, ref } from 'vue'
 import PouchDB from 'pouchdb'
-
-interface Comment {
-  id: string
-  author: string
-  content: string
-  date: string
-}
 
 interface Post {
   _id?: string
@@ -16,336 +9,244 @@ interface Post {
   author: string
   content: string
   date: string
-  comments?: Comment[]
 }
 
-// Référence à la base de données
-const storage = ref<any>(null)
-// Données stockées
-const postsData = ref<Post[]>([])
+const localDB = ref<any>()
+const remoteDB = ref<any>()
+const posts = ref<Post[]>([])
+const syncStatus = ref<string>('Non synchronisé')
+const isSyncing = ref<boolean>(false)
 
-// Formulaire pour ajouter / modifier post
-const formPost = reactive<Omit<Post, "_id" | "_rev">>({
-  title: "",
-  author: "",
-  content: "",
-  date: new Date().toISOString(),
-  comments: []
+const newPost = ref<Post>({
+  title: '',
+  author: '',
+  content: '',
+  date: new Date().toLocaleDateString(),
 })
 
-// Formulaire pour ajouter un commentaire
-const commentForm = reactive<Omit<Comment, "id" | "date">>({
-  author: "",
-  content: ""
-})
-
-// Mode édition
-const editId = ref<string | null>(null)
-const editRev = ref<string | null>(null)
-
-const initDatabase = () => {
-  storage.value = new PouchDB('http://admin:admin@localhost:5984/test_infradonn2')
+const initDB = () => {
+  localDB.value = new PouchDB('posts_local')
+  remoteDB.value = new PouchDB('http://admin:admin@localhost:5984/test_infradonn2')
+  syncFromRemote()
 }
 
-const fetchData = async () => {
-  if (!storage.value) return
+const fetchPosts = async () => {
+  if (!localDB.value) return
+  const result = await localDB.value.allDocs({ include_docs: true })
+  posts.value = result.rows.map((r: any) => r.doc as Post)
+}
+
+const syncFromRemote = async () => {
+  if (!localDB.value || !remoteDB.value) return
+  syncStatus.value = 'Téléchargement...'
+  isSyncing.value = true
   try {
-    const result = await storage.value.allDocs({ include_docs: true })
-    postsData.value = result.rows
-      .filter((row: any) => !!row.doc)
-      .map((row: any) => row.doc as Post)
-  } catch (err) {
-    console.error("Erreur fetch :", err)
+    await localDB.value.replicate.from(remoteDB.value)
+    syncStatus.value = 'Synchronisé ✓'
+    await fetchPosts()
+  } catch (e) {
+    syncStatus.value = 'Erreur ✗'
+  } finally {
+    isSyncing.value = false
   }
 }
 
-const addOrUpdatePost = async () => {
-  if (!storage.value) return
+const syncBidirectional = async () => {
+  if (!localDB.value || !remoteDB.value) return
+  syncStatus.value = 'Synchronisation bidirectionnelle...'
+  isSyncing.value = true
   try {
-    if (editId.value && editRev.value) {
-      await storage.value.put({
-        _id: editId.value,
-        _rev: editRev.value,
-        ...formPost
-      })
-      editId.value = null
-      editRev.value = null
-    } else {
-      await storage.value.post(formPost)
-    }
-    formPost.title = ""
-    formPost.author = ""
-    formPost.content = ""
-    formPost.date = new Date().toISOString()
-    formPost.comments = []
-    fetchData()
-  } catch (err) {
-    console.error("Erreur ajout/modif :", err)
+    await localDB.value.sync(remoteDB.value)
+    syncStatus.value = 'Synchronisé ✓'
+    await fetchPosts()
+  } catch (e) {
+    syncStatus.value = 'Erreur ✗'
+  } finally {
+    isSyncing.value = false
   }
 }
 
-const editPost = (post: Post) => {
-  formPost.title = post.title
-  formPost.author = post.author
-  formPost.content = post.content
-  formPost.date = post.date
-  formPost.comments = post.comments || []
-  editId.value = post._id || null
-  editRev.value = post._rev || null
+const createPost = async () => {
+  if (!localDB.value) return
+  await localDB.value.post(newPost.value)
+  newPost.value = { title: '', author: '', content: '', date: new Date().toLocaleDateString() }
+  await fetchPosts()
+  syncStatus.value = 'Modifications locales non synchronisées'
+}
+
+const updatePost = async (post: Post) => {
+  const title = prompt('Nouveau titre:', post.title)
+  if (!title) return
+  const content = prompt('Nouveau contenu:', post.content)
+  if (!content || !localDB.value) return
+  await localDB.value.put({
+    _id: post._id,
+    _rev: post._rev,
+    title,
+    author: post.author,
+    content,
+    date: post.date,
+  })
+  await fetchPosts()
+  syncStatus.value = 'Modifications locales non synchronisées'
 }
 
 const deletePost = async (post: Post) => {
-  if (!storage.value || !post._id || !post._rev) return
-  try {
-    await storage.value.remove(post._id, post._rev)
-    fetchData()
-  } catch (err) {
-    console.error("Erreur suppression :", err)
-  }
+  if (!localDB.value || !post._id || !post._rev) return
+  await localDB.value.remove(post._id, post._rev)
+  await fetchPosts()
+  syncStatus.value = 'Modifications locales non synchronisées'
 }
 
-const addComment = async (post: Post) => {
-  if (!storage.value) return
-  if (!commentForm.author || !commentForm.content) return
-
-  const newComment: Comment = {
-    id: Date.now().toString(),
-    author: commentForm.author,
-    content: commentForm.content,
-    date: new Date().toISOString()
-  }
-
-  const updatedComments = post.comments ? [...post.comments, newComment] : [newComment]
-
-  try {
-    await storage.value.put({
-      _id: post._id,
-      _rev: post._rev,
-      ...post,
-      comments: updatedComments
-    })
-    commentForm.author = ""
-    commentForm.content = ""
-    fetchData()
-  } catch (err) {
-    console.error("Erreur ajout commentaire :", err)
-  }
-}
-
-onMounted(() => {
-  initDatabase()
-  fetchData()
-})
+onMounted(() => initDB())
 </script>
 
 <template>
-  <section class="container">
-    <h1>📝 Mes Posts</h1>
+  <div class="container">
+    <h1>Gestion des Posts - Réplication</h1>
 
-    <!-- Formulaire Ajouter / Modifier -->
-    <form @submit.prevent="addOrUpdatePost" class="form-post">
-      <h2>{{ editId ? "✏️ Modifier le post" : "➕ Ajouter un post" }}</h2>
-      <input v-model="formPost.title" placeholder="Titre du post" required />
-      <input v-model="formPost.author" placeholder="Auteur" required />
-      <textarea v-model="formPost.content" placeholder="Contenu du post" rows="4" required></textarea>
-      <button type="submit">{{ editId ? "Mettre à jour" : "Ajouter" }}</button>
-    </form>
-
-    <!-- Liste des posts -->
-    <div v-if="postsData.length === 0" class="empty">
-      Aucun post trouvé.
-    </div>
-
-    <div v-else class="posts-list">
-      <div v-for="post in postsData" :key="post._id" class="post-card">
-        <h2>📌 {{ post.title }}</h2>
-        <p class="author">🖋️ {{ post.author }} - <small>📅 {{ new Date(post.date).toLocaleDateString() }}</small></p>
-        <p class="content">💬 {{ post.content }}</p>
-
-        <!-- Commentaires -->
-        <div v-if="post.comments && post.comments.length" class="comments">
-          <h3>💭 Commentaires :</h3>
-          <ul>
-            <li v-for="comment in post.comments" :key="comment.id">
-              <p>🗨️ {{ comment.content }}</p>
-              <small>— 👤 {{ comment.author }}, ⏱️ {{ new Date(comment.date).toLocaleString() }}</small>
-            </li>
-          </ul>
-        </div>
-
-        <!-- Ajouter un commentaire -->
-        <div class="comment-form">
-          <input v-model="commentForm.author" placeholder="Votre nom" />
-          <input v-model="commentForm.content" placeholder="Votre commentaire" />
-          <button @click.prevent="addComment(post)">➕ Ajouter commentaire</button>
-        </div>
-
-        <div class="actions">
-          <button @click="editPost(post)">✏️ Modifier post</button>
-          <button @click="deletePost(post)">🗑️ Supprimer post</button>
-        </div>
+    <div class="sync-panel">
+      <h3>Synchronisation</h3>
+      <p>
+        Statut:
+        <strong
+          :class="{
+            success: syncStatus.includes('✓'),
+            error: syncStatus.includes('✗'),
+            pending: !syncStatus.includes('✓') && !syncStatus.includes('✗'),
+          }"
+        >
+          {{ syncStatus }}
+        </strong>
+      </p>
+      <div class="buttons">
+        <button @click="syncBidirectional" :disabled="isSyncing">🔄 Synchroniser</button>
       </div>
+      <p class="note">
+        💡 Les modifications sont d'abord enregistrées localement. Cliquez sur "Synchroniser" pour
+        mettre à jour le serveur distant.
+      </p>
     </div>
-  </section>
+
+    <h2>Posts ({{ posts.length }})</h2>
+    <div v-if="posts.length === 0" class="empty">Aucun post pour le moment</div>
+
+    <article v-for="post in posts" :key="post._id" class="post">
+      <h3>{{ post.title }}</h3>
+      <p class="content">{{ post.content }}</p>
+      <p class="meta">
+        <strong>{{ post.author }}</strong> – {{ post.date }}
+      </p>
+      <div class="buttons">
+        <button @click="updatePost(post)">✏️ Modifier</button>
+        <button @click="deletePost(post)">🗑️ Supprimer</button>
+      </div>
+    </article>
+
+    <hr />
+
+    <h2>Créer un nouveau post</h2>
+    <div class="form">
+      <input v-model="newPost.title" placeholder="Titre" />
+      <input v-model="newPost.author" placeholder="Auteur" />
+      <textarea v-model="newPost.content" rows="5" placeholder="Contenu"></textarea>
+      <button @click="createPost">✅ Publier (localement)</button>
+    </div>
+  </div>
 </template>
 
 <style scoped>
 .container {
-  max-width: 900px;
-  margin: 20px auto;
-  font-family: Arial, sans-serif;
-  color: #222;
+  padding: 2rem;
+  max-width: 800px;
+  margin: auto;
+  color: #000;
 }
-
-h1 {
-  text-align: center;
-  margin-bottom: 20px;
-  color: #0077cc;
-  font-size: 2em;
+h1,
+h2 {
+  color: #f0f0f0;
 }
-
-.form-post {
-  border: 1px solid #ccc;
-  padding: 15px;
-  margin-bottom: 30px;
+.sync-panel {
+  background: #f5f5f5;
+  padding: 1rem;
   border-radius: 8px;
-  background: #e0f7fa; /* fond bleu clair */
+  margin-bottom: 2rem;
 }
-
-.form-post h2 {
+.sync-panel h3 {
   margin-top: 0;
-  color: #0077cc;
+  color: #000;
 }
-
-.form-post input,
-.form-post textarea {
-  width: 100%;
-  margin-bottom: 10px;
-  padding: 8px;
-  box-sizing: border-box;
-  border: 1px solid #aaa;
-  border-radius: 4px;
-  color: #222;
+.buttons {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 1rem;
 }
-
-.form-post button {
-  padding: 8px 12px;
-  cursor: pointer;
-  background-color: #0077cc;
+button {
+  padding: 0.75rem 1.5rem;
+  font-size: 1rem;
+  background: #1976d2;
   color: white;
   border: none;
   border-radius: 4px;
+  cursor: pointer;
+  font-weight: bold;
 }
-
-.empty {
-  text-align: center;
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.note {
+  font-size: 0.85rem;
+  color: #333;
+  margin-top: 0.5rem;
+}
+.success {
+  color: green;
+}
+.error {
+  color: red;
+}
+.pending {
+  color: orange;
+}
+.post {
+  border: 1px solid #ddd;
+  padding: 1rem;
+  margin: 1rem 0;
+  border-radius: 4px;
+  background: white;
+}
+.post h3 {
+  margin-top: 0;
+  color: #000;
+}
+.post .content {
+  white-space: pre-wrap;
+}
+.post .meta {
   color: #555;
-  font-size: 1.1em;
+  font-size: 0.9rem;
+  margin-bottom: 0.5rem;
 }
-
-.posts-list {
+.empty {
+  padding: 1rem;
+  background: #f0f0f0;
+  border-radius: 4px;
+}
+.form {
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 0.5rem;
 }
-
-.post-card {
+.form input,
+.form textarea {
+  padding: 0.5rem;
+  font-size: 1rem;
   border: 1px solid #ddd;
-  padding: 15px;
-  border-radius: 8px;
-  background: #fff3e0; /* fond doux orangé */
-  box-shadow: 1px 1px 6px rgba(0,0,0,0.05);
-}
-
-.post-card h2 {
-  margin-top: 0;
-  color: #d35400;
-}
-
-.post-card .author {
-  font-size: 0.9em;
-  color: #555;
-}
-
-.post-card .content {
-  margin: 10px 0;
-  color: #333;
-}
-
-.comments {
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid #eee;
-  background: #f1f8e9; /* fond doux vert clair pour commentaires */
-  border-radius: 6px;
-  padding: 10px;
-}
-
-.comments h3 {
-  margin: 0 0 5px 0;
-  color: #388e3c;
-}
-
-.comments ul {
-  padding-left: 15px;
-}
-
-.comments li {
-  margin-bottom: 8px;
-}
-
-.comments li p {
-  margin: 0;
-  color: #222;
-}
-
-.comments li small {
-  color: #555;
-}
-
-.comment-form {
-  margin-top: 10px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-}
-
-.comment-form input {
-  flex: 1;
-  padding: 6px;
-  border: 1px solid #aaa;
-  border-radius: 4px;
-  color: #222;
-}
-
-.comment-form button {
-  padding: 6px 10px;
-  cursor: pointer;
-  background-color: #28a745;
-  color: white;
-  border: none;
   border-radius: 4px;
 }
-
-.actions {
-  margin-top: 10px;
-  display: flex;
-  gap: 10px;
-}
-
-.actions button {
-  padding: 6px 10px;
-  cursor: pointer;
-  background-color: #0077cc;
-  color: white;
-  border: none;
-  border-radius: 4px;
-}
-
-/* Hover simple pour boutons */
-.actions button:hover,
-.comment-form button:hover,
-.form-post button:hover {
-  opacity: 0.85;
+.form textarea {
+  resize: vertical;
 }
 </style>
