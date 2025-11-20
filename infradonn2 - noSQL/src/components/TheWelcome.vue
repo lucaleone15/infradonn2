@@ -2,6 +2,13 @@
 import { onMounted, ref } from 'vue'
 import PouchDB from 'pouchdb'
 
+interface Comment {
+  id: string
+  author: string
+  content: string
+  date: string
+}
+
 interface Post {
   _id?: string
   _rev?: string
@@ -9,6 +16,8 @@ interface Post {
   author: string
   content: string
   date: string
+  likes?: number
+  comments?: Comment[]
 }
 
 const localDB = ref<any>(null)
@@ -17,6 +26,7 @@ const posts = ref<Post[]>([])
 const syncStatus = ref<string>('Non synchronisé')
 const isSyncing = ref<boolean>(false)
 const isOnline = ref<boolean>(true)
+const sortByLikes = ref(false)
 
 const newPost = ref<Post>({
   title: '',
@@ -28,10 +38,9 @@ const newPost = ref<Post>({
 // --- INIT DB ---
 const initDB = async () => {
   localDB.value = new PouchDB('posts_local')
-  remoteDB.value = new PouchDB('http://admin:admin@localhost:5984/test_infradonn2')
+  remoteDB.value = 'http://admin:admin@localhost:5984/test_infradonn2'
   await fetchPosts()
   listenToChanges()
-  // Si on démarre en online, on tente une réplication initiale
   if (isOnline.value) {
     syncFromRemote()
   }
@@ -44,7 +53,6 @@ const fetchPosts = async () => {
     const result = await localDB.value.allDocs({ include_docs: true })
     posts.value = result.rows
       .map((r: any) => r.doc as Post)
-      // trier par date (si date au format lisible) ou par _id pour stabilité
       .sort((a: any, b: any) => {
         if (a.date && b.date) return a.date < b.date ? 1 : -1
         return (a._id || '').localeCompare(b._id || '')
@@ -71,7 +79,7 @@ const syncFromRemote = async () => {
   }
 }
 
-// --- SYNC bidirectionnel (push+pull) ---
+// --- SYNC bidirectionnel avec gestion des conflits ---
 const syncBidirectional = async () => {
   if (!isOnline.value || !localDB.value || !remoteDB.value) {
     syncStatus.value = isOnline.value
@@ -82,7 +90,28 @@ const syncBidirectional = async () => {
   syncStatus.value = 'Synchronisation bidirectionnelle...'
   isSyncing.value = true
   try {
-    await localDB.value.sync(remoteDB.value)
+    const result = await localDB.value.sync(remoteDB.value, { retry: true })
+
+    const conflictsDocs = await localDB.value.allDocs({ include_docs: true, conflicts: true })
+    for (const row of conflictsDocs.rows) {
+      if (row.doc && row.doc._conflicts && row.doc._conflicts.length > 0) {
+        const choice = confirm(
+          `Conflit détecté pour "${row.doc.title}". Cliquez OK pour garder la version locale, Annuler pour prendre la version serveur.`,
+        )
+        if (choice) {
+          for (const rev of row.doc._conflicts) {
+            await localDB.value.remove(row.doc._id, rev)
+          }
+        } else {
+          const remoteDoc = await localDB.value.get(row.doc._id, { rev: row.doc._conflicts[0] })
+          await localDB.value.put({ ...remoteDoc, _rev: row.doc._rev })
+          for (const rev of row.doc._conflicts) {
+            await localDB.value.remove(row.doc._id, rev)
+          }
+        }
+      }
+    }
+
     syncStatus.value = 'Synchronisé ✓'
     await fetchPosts()
   } catch (e) {
@@ -102,6 +131,8 @@ const createPost = async () => {
     author: newPost.value.author || 'Anonyme',
     content: newPost.value.content || '',
     date: newPost.value.date || new Date().toLocaleDateString(),
+    likes: 0,
+    comments: [],
   }
   try {
     await localDB.value.put(doc)
@@ -120,14 +151,7 @@ const updatePost = async (post: Post) => {
   const content = prompt('Nouveau contenu :', post.content)
   if (content === null) return
   try {
-    const toPut = {
-      _id: post._id,
-      _rev: post._rev,
-      title,
-      author: post.author,
-      content,
-      date: post.date,
-    }
+    const toPut = { ...post, _id: post._id, _rev: post._rev, title, content }
     await localDB.value.put(toPut)
     await fetchPosts()
     syncStatus.value = 'Modifications locales non synchronisées'
@@ -148,19 +172,92 @@ const deletePost = async (post: Post) => {
   }
 }
 
-// --- TOGGLE connexion (ne pas inverser deux fois la valeur) ---
-// Le checkbox met déjà isOnline.value à jour grâce au v-model.
-// Ici on réagit à la nouvelle valeur, sans toggler à nouveau.
+// --- Likes / Commentaires ---
+const likePost = async (post: Post) => {
+  if (!localDB.value || !post._id || !post._rev) return
+  try {
+    await localDB.value.put({
+      ...post,
+      _id: post._id,
+      _rev: post._rev,
+      likes: (post.likes || 0) + 1,
+    })
+    await fetchPosts()
+    syncStatus.value = 'Modifications locales non synchronisées'
+  } catch (err) {
+    console.error('likePost error', err)
+  }
+}
+
+const addComment = async (post: Post) => {
+  if (!localDB.value || !post._id || !post._rev) return
+  const author = prompt('Auteur du commentaire :')
+  if (!author) return
+  const content = prompt('Contenu du commentaire :')
+  if (!content) return
+  const newComment: Comment = {
+    id: `cmt_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+    author,
+    content,
+    date: new Date().toLocaleDateString(),
+  }
+  try {
+    await localDB.value.put({
+      ...post,
+      _id: post._id,
+      _rev: post._rev,
+      comments: [...(post.comments || []), newComment],
+    })
+    await fetchPosts()
+    syncStatus.value = 'Modifications locales non synchronisées'
+  } catch (err) {
+    console.error('addComment error', err)
+  }
+}
+
+const updateComment = async (post: Post, comment: Comment) => {
+  if (!localDB.value || !post._id || !post._rev) return
+  const newContent = prompt('Modifier le contenu du commentaire :', comment.content)
+  if (newContent === null) return
+  try {
+    await localDB.value.put({
+      ...post,
+      _id: post._id,
+      _rev: post._rev,
+      comments: (post.comments || []).map((c) =>
+        c.id === comment.id ? { ...c, content: newContent } : c,
+      ),
+    })
+    await fetchPosts()
+    syncStatus.value = 'Modifications locales non synchronisées'
+  } catch (err) {
+    console.error('updateComment error', err)
+  }
+}
+
+const deleteComment = async (post: Post, commentId: string) => {
+  if (!localDB.value || !post._id || !post._rev) return
+  try {
+    await localDB.value.put({
+      ...post,
+      _id: post._id,
+      _rev: post._rev,
+      comments: (post.comments || []).filter((c) => c.id !== commentId),
+    })
+    await fetchPosts()
+    syncStatus.value = 'Modifications locales non synchronisées'
+  } catch (err) {
+    console.error('deleteComment error', err)
+  }
+}
+
+// --- TOGGLE connexion ---
 const toggleConnection = () => {
   if (isOnline.value) {
-    // passé en ligne
     syncStatus.value = 'Reconnexion : synchronisation en cours...'
-    // lancement de la sync bidirectionnelle en tâche immédiate
     syncBidirectional()
   } else {
-    // passé en offline
-    syncStatus.value = 'Mode offline activé 📴'
-    // On n'annule pas les listeners locaux ; on bloque simplement les réplications
+    syncStatus.value = 'Mode offline activé'
   }
 }
 
@@ -168,30 +265,18 @@ const toggleConnection = () => {
 let changesFeed: any = null
 const listenToChanges = () => {
   if (!localDB.value) return
-  // Si un feed existait, cancel
   if (changesFeed && typeof changesFeed.cancel === 'function') {
     try {
       changesFeed.cancel()
-    } catch (e) {
-      /* ignore */
-    }
+    } catch (e) {}
   }
   changesFeed = localDB.value
-    .changes({
-      since: 'now',
-      live: true,
-      include_docs: true,
-    })
-    .on('change', async (ch: any) => {
-      // Un changement local ou provenant d'une réplication -> raffraîchir la liste
-      await fetchPosts()
-    })
-    .on('error', (err: any) => {
-      console.error('changes feed error', err)
-    })
+    .changes({ since: 'now', live: true, include_docs: true })
+    .on('change', async () => await fetchPosts())
+    .on('error', (err: any) => console.error('changes feed error', err))
 }
 
-// --- FACTORY pour générer des documents de test ---
+// --- Factory pour générer des posts de test ---
 const generateFakePosts = async (count = 50) => {
   if (!localDB.value) return
   const now = Date.now()
@@ -201,6 +286,8 @@ const generateFakePosts = async (count = 50) => {
     author: `Auteur ${Math.ceil(Math.random() * 6)}`,
     content: `Texte de test pour le post ${i + 1}\nLigne supplémentaire.`,
     date: new Date().toLocaleDateString(),
+    likes: 0,
+    comments: [],
   }))
   try {
     await localDB.value.bulkDocs(bulk)
@@ -211,39 +298,21 @@ const generateFakePosts = async (count = 50) => {
   }
 }
 
-// --- RECHERCHE (sans plugin) : filtrage côté client ---
 const searchQuery = ref('')
-const searchResults = ref<Post[]>([])
 
-const searchLocal = () => {
-  const q = searchQuery.value.trim().toLowerCase()
-  if (!q) {
-    searchResults.value = []
-    return
-  }
-  // recherche sur author et title (insensible à la casse)
-  searchResults.value = posts.value.filter((p) => {
-    return (
-      (p.author && p.author.toLowerCase().includes(q)) ||
-      (p.title && p.title.toLowerCase().includes(q))
-    )
-  })
-}
-
-// nettoyage du feed quand le composant est détruit (bonne pratique)
 onMounted(() => initDB())
 </script>
 
 <template>
   <div class="container">
-    <h1>Gestion des Posts — Réplication</h1>
+    <h1>Gestion des Posts - Réplication</h1>
 
     <!-- Online / Offline -->
     <div class="panel small">
       <label class="inline-toggle">
         <input type="checkbox" v-model="isOnline" @change="toggleConnection" />
         <span class="slider"></span>
-        <span class="label-text">{{ isOnline ? '🟢 Online' : '🔴 Offline' }}</span>
+        <span class="label-text">{{ isOnline ? 'Online' : 'Offline' }}</span>
       </label>
       <p class="status">
         Statut sync :
@@ -261,13 +330,11 @@ onMounted(() => initDB())
     <!-- Sync controls -->
     <div class="panel">
       <div class="controls">
-        <button @click="syncBidirectional" :disabled="isSyncing || !isOnline">
-          🔄 Synchroniser
-        </button>
+        <button @click="syncBidirectional" :disabled="isSyncing || !isOnline">Synchroniser</button>
         <button @click="syncFromRemote" :disabled="isSyncing || !isOnline">
-          ⬇️ Télécharger depuis serveur
+          Télécharger depuis serveur
         </button>
-        <button @click="generateFakePosts(10)">🧰 Générer 10 posts</button>
+        <button @click="generateFakePosts(100)">Générer 100 posts</button>
       </div>
       <p class="note">
         Les modifications sont d'abord enregistrées localement. Cliquez sur
@@ -275,23 +342,11 @@ onMounted(() => initDB())
       </p>
     </div>
 
-    <!-- Recherche -->
+    <!-- Recherche & tri -->
     <div class="panel">
       <div class="search-row">
-        <input
-          v-model="searchQuery"
-          @input="searchLocal"
-          placeholder="Rechercher par auteur ou titre..."
-        />
-        <button @click="searchLocal">🔍</button>
-      </div>
-      <div v-if="searchResults.length > 0" class="search-results">
-        <h4>Résultats ({{ searchResults.length }})</h4>
-        <ul>
-          <li v-for="p in searchResults" :key="p._id">
-            <strong>{{ p.title }}</strong> — <em>{{ p.author }}</em>
-          </li>
-        </ul>
+        <input v-model="searchQuery" placeholder="Rechercher par auteur ou titre..." />
+        <label> <input type="checkbox" v-model="sortByLikes" /> Trier par nombre de likes </label>
       </div>
     </div>
 
@@ -299,19 +354,42 @@ onMounted(() => initDB())
     <h2>Posts ({{ posts.length }})</h2>
     <div v-if="posts.length === 0" class="empty">Aucun post pour le moment</div>
 
-    <article v-for="post in posts" :key="post._id" class="post">
+    <article
+      v-for="post in posts
+        .filter((p) => {
+          const q = searchQuery.trim().toLowerCase()
+          return !q || p.title.toLowerCase().includes(q) || p.author.toLowerCase().includes(q)
+        })
+        .slice()
+        .sort((a, b) => (sortByLikes ? (b.likes || 0) - (a.likes || 0) : 0))"
+      :key="post._id"
+      class="post"
+    >
       <div class="post-head">
         <h3>{{ post.title }}</h3>
         <div class="meta">
           <span class="author">{{ post.author }}</span>
-          <span class="date">— {{ post.date }}</span>
+          <span class="date"> - {{ post.date }}</span>
         </div>
       </div>
+
       <p class="content">{{ post.content }}</p>
+
       <div class="post-actions">
-        <button @click="updatePost(post)">✏️ Modifier</button>
-        <button @click="deletePost(post)">🗑️ Supprimer</button>
+        <button @click="updatePost(post)">Modifier</button>
+        <button @click="deletePost(post)">Supprimer</button>
+        <button @click="likePost(post)">Like(s) : {{ post.likes || 0 }}</button>
+        <button @click="addComment(post)">Commenter</button>
       </div>
+
+      <ul v-if="post.comments && post.comments.length > 0" class="comments">
+        <li v-for="c in post.comments" :key="c.id">
+          <strong>{{ c.author }}:</strong> {{ c.content }}
+          <span class="date"> - {{ c.date }}</span>
+          <button @click="updateComment(post, c)">Modifier</button>
+          <button @click="deleteComment(post, c.id)">Supprimer</button>
+        </li>
+      </ul>
     </article>
 
     <hr />
@@ -324,7 +402,7 @@ onMounted(() => initDB())
         <input v-model="newPost.author" placeholder="Auteur" />
         <textarea v-model="newPost.content" rows="5" placeholder="Contenu"></textarea>
         <div class="form-actions">
-          <button @click="createPost">✅ Publier (localement)</button>
+          <button @click="createPost">Publier (localement)</button>
         </div>
       </div>
     </div>
@@ -333,10 +411,10 @@ onMounted(() => initDB())
 
 <style scoped>
 :root {
-  --bg: #0f172a; /* fond principal sombre */
-  --panel: #1e293b; /* panneau plus clair */
-  --accent: #3b82f6; /* bleu vif */
-  --muted: #9ca3af; /* texte secondaire */
+  --bg: #0f172a;
+  --panel: #1e293b;
+  --accent: #3b82f6;
+  --muted: #9ca3af;
   --success: #22c55e;
   --error: #ef4444;
   --pending: #facc15;
@@ -362,7 +440,6 @@ h2,
 h3 {
   color: #ffffff;
 }
-
 h1 {
   font-size: 1.6rem;
   margin-bottom: 0.75rem;
@@ -375,14 +452,12 @@ h3 {
   font-size: 1.05rem;
 }
 
-/* Panels */
 .panel {
   background: var(--panel);
   padding: 1rem;
   border-radius: 10px;
   margin-bottom: 1rem;
   border: 1px solid rgba(255, 255, 255, 0.08);
-  color: white;
 }
 .panel.small {
   display: flex;
@@ -390,7 +465,6 @@ h3 {
   justify-content: space-between;
 }
 
-/* Toggle inline */
 .inline-toggle {
   display: inline-flex;
   align-items: center;
@@ -408,7 +482,6 @@ h3 {
   color: white;
 }
 
-/* Controls */
 .controls {
   display: flex;
   gap: 0.5rem;
@@ -433,7 +506,6 @@ button:disabled {
   cursor: not-allowed;
 }
 
-/* Search */
 .search-row {
   display: flex;
   gap: 0.5rem;
@@ -451,7 +523,6 @@ button:disabled {
   color: #9ca3af;
 }
 
-/* Posts */
 .post {
   border: 1px solid #334155;
   padding: 1rem;
@@ -486,7 +557,22 @@ button:disabled {
   background: #64748b;
 }
 
-/* Form */
+.comments {
+  margin-top: 0.5rem;
+  padding-left: 1rem;
+}
+.comments li {
+  margin-bottom: 0.25rem;
+  font-size: 0.95rem;
+}
+.comments button {
+  margin-left: 0.5rem;
+  background: #ef4444;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+}
+
 .form {
   display: flex;
   flex-direction: column;
@@ -509,7 +595,6 @@ button:disabled {
   margin-top: 0.25rem;
 }
 
-/* Status classes */
 .success {
   color: var(--success);
   font-weight: 700;
@@ -530,7 +615,6 @@ button:disabled {
   color: var(--muted);
 }
 
-/* responsive */
 @media (max-width: 640px) {
   .controls {
     flex-direction: column;
