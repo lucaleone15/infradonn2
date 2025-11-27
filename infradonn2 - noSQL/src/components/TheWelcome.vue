@@ -1,7 +1,11 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import PouchDB from 'pouchdb'
+import PouchDBFind from 'pouchdb-find'
 
+PouchDB.plugin(PouchDBFind)
+
+// --- TYPES ---
 interface Comment {
   id: string
   author: string
@@ -12,398 +16,453 @@ interface Comment {
 interface Post {
   _id?: string
   _rev?: string
+  type: string
   title: string
   author: string
   content: string
+  likes: number
   date: string
-  likes?: number
-  comments?: Comment[]
+  comments: Comment[]
+  _conflicts?: string[]
+  showComments?: boolean
 }
 
+// --- STATE ---
 const localDB = ref<any>(null)
 const remoteDB = ref<any>(null)
 const posts = ref<Post[]>([])
-const syncStatus = ref<string>('Non synchronisé')
-const isSyncing = ref<boolean>(false)
-const isOnline = ref<boolean>(true)
-const sortByLikes = ref(false)
 
-const newPost = ref<Post>({
-  title: '',
-  author: '',
-  content: '',
-  date: new Date().toLocaleDateString(),
-})
+// Sync & Status
+const isOnline = ref(true)
+const statusMsg = ref('Initialisation...')
+const syncHandler = ref<any>(null)
 
-// --- INIT DB ---
-const initDB = async () => {
+// Recherche & Tri
+const searchQuery = ref('')
+const sortType = ref<'date' | 'likes'>('likes') // Par défaut: top 10 likés
+const sortDirection = ref<'asc' | 'desc'>('desc')
+
+// Form
+const newPost = ref({ title: '', author: '', content: '' })
+
+// --- INIT ---
+onMounted(async () => {
   localDB.value = new PouchDB('posts_local')
   remoteDB.value = 'http://admin:admin@localhost:5984/test_infradonn2'
-  await fetchPosts()
-  listenToChanges()
-  if (isOnline.value) {
-    syncFromRemote()
-  }
-}
 
-// --- FETCH posts depuis la base locale ---
-const fetchPosts = async () => {
-  if (!localDB.value) return
   try {
-    const result = await localDB.value.allDocs({ include_docs: true })
-    posts.value = result.rows
-      .map((r: any) => r.doc as Post)
-      .sort((a: any, b: any) => {
-        if (a.date && b.date) return a.date < b.date ? 1 : -1
-        return (a._id || '').localeCompare(b._id || '')
-      })
-  } catch (err) {
-    console.error('fetchPosts error', err)
-  }
-}
-
-// --- SYNC from remote (pull) ---
-const syncFromRemote = async () => {
-  if (!isOnline.value || !localDB.value || !remoteDB.value) return
-  syncStatus.value = 'Téléchargement...'
-  isSyncing.value = true
-  try {
-    await localDB.value.replicate.from(remoteDB.value)
-    syncStatus.value = 'Synchronisé ✓'
-    await fetchPosts()
+    await localDB.value.createIndex({
+      index: { fields: ['likes'] },
+    })
   } catch (e) {
-    console.error('replicate.from error', e)
-    syncStatus.value = 'Erreur ✗'
-  } finally {
-    isSyncing.value = false
+    console.error('Erreur Index', e)
+  }
+
+  updateSyncState()
+  fetchData()
+
+  localDB.value
+    .changes({ since: 'now', live: true, include_docs: true, conflicts: true })
+    .on('change', () => fetchData())
+})
+
+// --- SYNCHRONISATION ---
+const updateSyncState = () => {
+  if (syncHandler.value) {
+    syncHandler.value.cancel()
+    syncHandler.value = null
+  }
+
+  if (isOnline.value) {
+    statusMsg.value = 'En ligne (Synchronisation active)'
+    syncHandler.value = localDB.value
+      .sync(remoteDB.value, {
+        live: true,
+        retry: true,
+        conflicts: true,
+      })
+      .on('error', (err: any) => {
+        console.error('Erreur sync:', err)
+        statusMsg.value = 'Erreur connexion serveur'
+      })
+      .on('paused', () => (statusMsg.value = 'En ligne (En attente)'))
+      .on('active', () => (statusMsg.value = 'Synchronisation en cours...'))
+      .on('change', (info: any) => {
+        console.log('Changement sync:', info)
+        if (info.direction === 'pull') {
+          fetchData()
+        }
+      })
+  } else {
+    statusMsg.value = 'Hors ligne (Mode local uniquement)'
   }
 }
 
-// --- SYNC bidirectionnel avec gestion des conflits ---
-const syncBidirectional = async () => {
-  if (!isOnline.value || !localDB.value || !remoteDB.value) {
-    syncStatus.value = isOnline.value
-      ? 'DB non initialisée'
-      : 'Hors ligne - impossible de synchroniser'
-    return
-  }
-  syncStatus.value = 'Synchronisation bidirectionnelle...'
-  isSyncing.value = true
-  try {
-    const result = await localDB.value.sync(remoteDB.value, { retry: true })
+// --- RECHERCHE & TRI ---
+const fetchData = async () => {
+  if (!localDB.value) return
 
-    const conflictsDocs = await localDB.value.allDocs({ include_docs: true, conflicts: true })
-    for (const row of conflictsDocs.rows) {
-      if (row.doc && row.doc._conflicts && row.doc._conflicts.length > 0) {
-        const choice = confirm(
-          `Conflit détecté pour "${row.doc.title}". Cliquez OK pour garder la version locale, Annuler pour prendre la version serveur.`,
-        )
-        if (choice) {
-          for (const rev of row.doc._conflicts) {
-            await localDB.value.remove(row.doc._id, rev)
-          }
-        } else {
-          const remoteDoc = await localDB.value.get(row.doc._id, { rev: row.doc._conflicts[0] })
-          await localDB.value.put({ ...remoteDoc, _rev: row.doc._rev })
-          for (const rev of row.doc._conflicts) {
-            await localDB.value.remove(row.doc._id, rev)
-          }
-        }
+  try {
+    if (sortType.value === 'likes') {
+      const selector: any = {
+        type: 'post',
+        likes: { $gte: 0 },
       }
+
+      if (searchQuery.value) {
+        selector.title = { $regex: RegExp(searchQuery.value, 'i') }
+      }
+
+      const result = await localDB.value.find({
+        selector: selector,
+        sort: [{ likes: sortDirection.value }],
+        limit: 10,
+        conflicts: true,
+      })
+
+      posts.value = result.docs.map((d: Post) => {
+        const existing = posts.value.find((p) => p._id === d._id)
+        return { ...d, showComments: existing ? existing.showComments : false }
+      })
+    } else {
+      const result = await localDB.value.allDocs({
+        include_docs: true,
+        conflicts: true,
+        startkey: sortDirection.value === 'desc' ? 'post_\ufff0' : 'post_',
+        endkey: sortDirection.value === 'desc' ? 'post_' : 'post_\ufff0',
+        descending: sortDirection.value === 'desc',
+      })
+
+      let docs = result.rows
+        .map((row: any) => row.doc)
+        .filter((doc: any) => doc && doc.type === 'post')
+
+      if (searchQuery.value) {
+        const regex = new RegExp(searchQuery.value, 'i')
+        docs = docs.filter((doc: any) => regex.test(doc.title))
+      }
+
+      posts.value = docs.map((d: Post) => {
+        const existing = posts.value.find((p) => p._id === d._id)
+        return { ...d, showComments: existing ? existing.showComments : false }
+      })
+    }
+  } catch (e) {
+    console.error('Erreur Find', e)
+  }
+}
+
+watch([searchQuery, sortType, sortDirection], fetchData)
+
+// --- GESTION CONFLITS ---
+const resolveConflict = async (post: Post) => {
+  if (!post._conflicts || post._conflicts.length === 0) return
+
+  try {
+    const conflictRev = post._conflicts[0]
+    const versionDistante = await localDB.value.get(post._id, { rev: conflictRev })
+
+    const choice = confirm(
+      `⚠️ CONFLIT DÉTECTÉ\n\n` +
+        `Deux versions différentes existent pour "${post.title}":\n\n` +
+        `VERSION 1 (Locale):\n` +
+        `${post.content.substring(0, 100)}...\n` +
+        `Likes: ${post.likes}\n\n` +
+        `VERSION 2 (Distante):\n` +
+        `${versionDistante.content.substring(0, 100)}...\n` +
+        `Likes: ${versionDistante.likes}\n\n` +
+        `OK = Garder Version 1 (Locale)\n` +
+        `ANNULER = Garder Version 2 (Distante)`,
+    )
+
+    if (choice) {
+      await localDB.value.remove(post._id, conflictRev)
+      statusMsg.value = '✓ Version locale conservée'
+    } else {
+      const versionLocale = await localDB.value.get(post._id)
+
+      const nouvelleVersion = {
+        ...versionLocale,
+        title: versionDistante.title,
+        content: versionDistante.content,
+        author: versionDistante.author,
+        likes: versionDistante.likes,
+        comments: versionDistante.comments,
+        date: versionDistante.date,
+      }
+
+      await localDB.value.put(nouvelleVersion)
+      await localDB.value.remove(post._id, conflictRev)
+      statusMsg.value = '✓ Version distante conservée'
     }
 
-    syncStatus.value = 'Synchronisé ✓'
-    await fetchPosts()
+    setTimeout(() => {
+      statusMsg.value = isOnline.value ? 'En ligne (En attente)' : 'Hors ligne'
+    }, 2000)
   } catch (e) {
-    console.error('sync error', e)
-    syncStatus.value = 'Erreur ✗'
-  } finally {
-    isSyncing.value = false
+    console.error('Erreur résolution conflit:', e)
+    alert('Erreur lors de la résolution du conflit')
   }
 }
 
-// --- CRUD ---
+// --- CRUD POSTS ---
 const createPost = async () => {
-  if (!localDB.value) return
-  const doc: Post & { _id: string } = {
-    _id: `post_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
-    title: newPost.value.title || '(sans titre)',
-    author: newPost.value.author || 'Anonyme',
-    content: newPost.value.content || '',
-    date: newPost.value.date || new Date().toLocaleDateString(),
+  if (!newPost.value.title || !newPost.value.author) return alert('Champs requis')
+
+  const doc: Post = {
+    _id: `post_${Date.now()}`,
+    type: 'post',
+    title: newPost.value.title,
+    author: newPost.value.author,
+    content: newPost.value.content,
     likes: 0,
+    date: new Date().toLocaleString(),
     comments: [],
   }
+
   try {
     await localDB.value.put(doc)
-    newPost.value = { title: '', author: '', content: '', date: new Date().toLocaleDateString() }
-    await fetchPosts()
-    syncStatus.value = 'Modifications locales non synchronisées'
-  } catch (err) {
-    console.error('createPost error', err)
+    newPost.value = { title: '', author: '', content: '' }
+  } catch (e) {
+    console.error(e)
   }
 }
 
 const updatePost = async (post: Post) => {
-  if (!localDB.value || !post._id) return
-  const title = prompt('Nouveau titre :', post.title)
-  if (title === null) return
-  const content = prompt('Nouveau contenu :', post.content)
-  if (content === null) return
-  try {
-    const toPut = { ...post, _id: post._id, _rev: post._rev, title, content }
-    await localDB.value.put(toPut)
-    await fetchPosts()
-    syncStatus.value = 'Modifications locales non synchronisées'
-  } catch (err) {
-    console.error('updatePost error', err)
+  const doc = await localDB.value.get(post._id)
+  const newTxt = prompt('Modifier le contenu :', doc.content)
+  if (newTxt !== null) {
+    doc.content = newTxt
+    await localDB.value.put(doc)
   }
 }
 
 const deletePost = async (post: Post) => {
-  if (!localDB.value || !post._id || !post._rev) return
-  if (!confirm(`Supprimer "${post.title}" ?`)) return
-  try {
-    await localDB.value.remove(post._id, post._rev)
-    await fetchPosts()
-    syncStatus.value = 'Modifications locales non synchronisées'
-  } catch (err) {
-    console.error('deletePost error', err)
+  if (confirm('Supprimer ce post ?')) {
+    const doc = await localDB.value.get(post._id)
+    await localDB.value.remove(doc)
   }
 }
 
-// --- Likes / Commentaires ---
-const likePost = async (post: Post) => {
-  if (!localDB.value || !post._id || !post._rev) return
-  try {
-    await localDB.value.put({
-      ...post,
-      _id: post._id,
-      _rev: post._rev,
-      likes: (post.likes || 0) + 1,
-    })
-    await fetchPosts()
-    syncStatus.value = 'Modifications locales non synchronisées'
-  } catch (err) {
-    console.error('likePost error', err)
-  }
+const addLike = async (post: Post) => {
+  const doc = await localDB.value.get(post._id)
+  doc.likes++
+  await localDB.value.put(doc)
 }
 
+// --- CRUD COMMENTAIRES ---
 const addComment = async (post: Post) => {
-  if (!localDB.value || !post._id || !post._rev) return
-  const author = prompt('Auteur du commentaire :')
+  const author = prompt('Votre Nom :')
   if (!author) return
-  const content = prompt('Contenu du commentaire :')
+  const content = prompt('Commentaire :')
   if (!content) return
-  const newComment: Comment = {
-    id: `cmt_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+
+  const doc = await localDB.value.get(post._id)
+  doc.comments.push({
+    id: Date.now().toString(),
     author,
     content,
-    date: new Date().toLocaleDateString(),
-  }
-  try {
-    await localDB.value.put({
-      ...post,
-      _id: post._id,
-      _rev: post._rev,
-      comments: [...(post.comments || []), newComment],
-    })
-    await fetchPosts()
-    syncStatus.value = 'Modifications locales non synchronisées'
-  } catch (err) {
-    console.error('addComment error', err)
-  }
+    date: new Date().toLocaleTimeString(),
+  })
+  await localDB.value.put(doc)
+
+  const p = posts.value.find((x) => x._id === post._id)
+  if (p) p.showComments = true
 }
 
-const updateComment = async (post: Post, comment: Comment) => {
-  if (!localDB.value || !post._id || !post._rev) return
-  const newContent = prompt('Modifier le contenu du commentaire :', comment.content)
-  if (newContent === null) return
-  try {
-    await localDB.value.put({
-      ...post,
-      _id: post._id,
-      _rev: post._rev,
-      comments: (post.comments || []).map((c) =>
-        c.id === comment.id ? { ...c, content: newContent } : c,
-      ),
-    })
-    await fetchPosts()
-    syncStatus.value = 'Modifications locales non synchronisées'
-  } catch (err) {
-    console.error('updateComment error', err)
+const updateComment = async (post: Post, commentId: string) => {
+  const doc = await localDB.value.get(post._id)
+  const c = doc.comments.find((x: Comment) => x.id === commentId)
+  if (c) {
+    const newTxt = prompt('Modifier commentaire :', c.content)
+    if (newTxt !== null) {
+      c.content = newTxt
+      await localDB.value.put(doc)
+    }
   }
 }
 
 const deleteComment = async (post: Post, commentId: string) => {
-  if (!localDB.value || !post._id || !post._rev) return
-  try {
-    await localDB.value.put({
-      ...post,
-      _id: post._id,
-      _rev: post._rev,
-      comments: (post.comments || []).filter((c) => c.id !== commentId),
+  if (confirm('Supprimer ce commentaire ?')) {
+    const doc = await localDB.value.get(post._id)
+    doc.comments = doc.comments.filter((x: Comment) => x.id !== commentId)
+    await localDB.value.put(doc)
+  }
+}
+
+const toggleComments = (post: Post) => {
+  post.showComments = !post.showComments
+}
+
+// --- FACTORY ---
+const runFactory = async () => {
+  const docs = []
+  for (let i = 0; i < 10; i++) {
+    docs.push({
+      _id: `post_${Date.now() + i}`,
+      type: 'post',
+      title: `Article Généré ${i}`,
+      author: 'Bot Factory',
+      content: 'Contenu de test généré automatiquement.',
+      likes: Math.floor(Math.random() * 100),
+      date: new Date().toLocaleString(),
+      comments: [],
     })
-    await fetchPosts()
-    syncStatus.value = 'Modifications locales non synchronisées'
-  } catch (err) {
-    console.error('deleteComment error', err)
   }
+  await localDB.value.bulkDocs(docs)
 }
-
-// --- TOGGLE connexion ---
-const toggleConnection = () => {
-  if (isOnline.value) {
-    syncStatus.value = 'Reconnexion : synchronisation en cours...'
-    syncBidirectional()
-  } else {
-    syncStatus.value = 'Mode offline activé'
-  }
-}
-
-// --- Écoute des changements locaux (live) ---
-let changesFeed: any = null
-const listenToChanges = () => {
-  if (!localDB.value) return
-  if (changesFeed && typeof changesFeed.cancel === 'function') {
-    try {
-      changesFeed.cancel()
-    } catch (e) {}
-  }
-  changesFeed = localDB.value
-    .changes({ since: 'now', live: true, include_docs: true })
-    .on('change', async () => await fetchPosts())
-    .on('error', (err: any) => console.error('changes feed error', err))
-}
-
-// --- Factory pour générer des posts de test ---
-const generateFakePosts = async (count = 50) => {
-  if (!localDB.value) return
-  const now = Date.now()
-  const bulk = Array.from({ length: count }).map((_, i) => ({
-    _id: `post_${now}_${i}`,
-    title: `Post ${i + 1}`,
-    author: `Auteur ${Math.ceil(Math.random() * 6)}`,
-    content: `Texte de test pour le post ${i + 1}\nLigne supplémentaire.`,
-    date: new Date().toLocaleDateString(),
-    likes: 0,
-    comments: [],
-  }))
-  try {
-    await localDB.value.bulkDocs(bulk)
-    await fetchPosts()
-    syncStatus.value = `Généré ${count} posts localement`
-  } catch (err) {
-    console.error('generateFakePosts error', err)
-  }
-}
-
-const searchQuery = ref('')
-
-onMounted(() => initDB())
 </script>
 
 <template>
   <div class="container">
-    <h1>Gestion des Posts - Réplication</h1>
+    <h1>TP InfraDonn2 - Blog NoSQL</h1>
 
-    <!-- Online / Offline -->
     <div class="panel small">
       <label class="inline-toggle">
-        <input type="checkbox" v-model="isOnline" @change="toggleConnection" />
-        <span class="slider"></span>
-        <span class="label-text">{{ isOnline ? 'Online' : 'Offline' }}</span>
+        <input type="checkbox" v-model="isOnline" @change="updateSyncState" />
+        <span class="label-text">{{ isOnline ? 'En Ligne' : 'Hors Ligne' }}</span>
       </label>
-      <p class="status">
-        Statut sync :
-        <strong
-          :class="{
-            success: syncStatus.includes('✓'),
-            error: syncStatus.includes('✗'),
-            pending: !syncStatus.includes('✓') && !syncStatus.includes('✗'),
-          }"
-          >{{ syncStatus }}</strong
-        >
-      </p>
+      <span :class="{ success: isOnline, error: !isOnline }" style="font-weight: bold">
+        {{ statusMsg }}
+      </span>
     </div>
 
-    <!-- Sync controls -->
-    <div class="panel">
-      <div class="controls">
-        <button @click="syncBidirectional" :disabled="isSyncing || !isOnline">Synchroniser</button>
-        <button @click="syncFromRemote" :disabled="isSyncing || !isOnline">
-          Télécharger depuis serveur
-        </button>
-        <button @click="generateFakePosts(100)">Générer 100 posts</button>
-      </div>
-      <p class="note">
-        Les modifications sont d'abord enregistrées localement. Cliquez sur
-        <em>Synchroniser</em> pour pousser/puller vers CouchDB.
-      </p>
-    </div>
+    <div class="panel controls">
+      <button @click="runFactory">Générer Données (Factory)</button>
 
-    <!-- Recherche & tri -->
-    <div class="panel">
       <div class="search-row">
-        <input v-model="searchQuery" placeholder="Rechercher par auteur ou titre..." />
-        <label> <input type="checkbox" v-model="sortByLikes" /> Trier par nombre de likes </label>
+        <input v-model="searchQuery" placeholder="Rechercher un titre..." />
+      </div>
+
+      <div class="search-row" style="justify-content: space-between">
+        <label>Trier par :</label>
+        <select v-model="sortType" style="padding: 5px; border-radius: 4px">
+          <option value="date">Date (Chronologique)</option>
+          <option value="likes">Top 10 Likes</option>
+        </select>
+
+        <select v-model="sortDirection" style="padding: 5px; border-radius: 4px">
+          <option value="desc">Décroissant</option>
+          <option value="asc">Croissant</option>
+        </select>
       </div>
     </div>
 
-    <!-- Liste des posts -->
-    <h2>Posts ({{ posts.length }})</h2>
-    <div v-if="posts.length === 0" class="empty">Aucun post pour le moment</div>
+    <div class="panel">
+      <h3>Nouveau Message</h3>
+      <div class="form">
+        <input v-model="newPost.title" placeholder="Titre" />
+        <input v-model="newPost.author" placeholder="Auteur" />
+        <textarea v-model="newPost.content" placeholder="Contenu..."></textarea>
+        <div class="form-actions">
+          <button @click="createPost">Publier</button>
+        </div>
+      </div>
+    </div>
 
-    <article
-      v-for="post in posts
-        .filter((p) => {
-          const q = searchQuery.trim().toLowerCase()
-          return !q || p.title.toLowerCase().includes(q) || p.author.toLowerCase().includes(q)
-        })
-        .slice()
-        .sort((a, b) => (sortByLikes ? (b.likes || 0) - (a.likes || 0) : 0))"
-      :key="post._id"
-      class="post"
-    >
+    <hr />
+
+    <div v-if="posts.length === 0" class="empty">Aucun post trouvé.</div>
+
+    <div v-for="post in posts" :key="post._id" class="post">
+      <div v-if="post._conflicts && post._conflicts.length > 0" class="conflict-banner">
+        <div>
+          <strong>Conflit !</strong>
+          <span style="font-size: 0.9rem; margin-left: 10px">
+            Ce document a été modifié en même temps à deux endroits
+          </span>
+        </div>
+        <button @click="resolveConflict(post)" class="resolve-btn">Résoudre</button>
+      </div>
+
       <div class="post-head">
         <h3>{{ post.title }}</h3>
         <div class="meta">
-          <span class="author">{{ post.author }}</span>
-          <span class="date"> - {{ post.date }}</span>
+          {{ post.date }} | Par {{ post.author }} |
+          <span class="pending">Likes: {{ post.likes }}</span>
         </div>
       </div>
 
       <p class="content">{{ post.content }}</p>
 
       <div class="post-actions">
+        <button @click="addLike(post)">Like</button>
         <button @click="updatePost(post)">Modifier</button>
         <button @click="deletePost(post)">Supprimer</button>
-        <button @click="likePost(post)">Like(s) : {{ post.likes || 0 }}</button>
         <button @click="addComment(post)">Commenter</button>
       </div>
 
-      <ul v-if="post.comments && post.comments.length > 0" class="comments">
-        <li v-for="c in post.comments" :key="c.id">
-          <strong>{{ c.author }}:</strong> {{ c.content }}
-          <span class="date"> - {{ c.date }}</span>
-          <button @click="updateComment(post, c)">Modifier</button>
-          <button @click="deleteComment(post, c.id)">Supprimer</button>
-        </li>
-      </ul>
-    </article>
-
-    <hr />
-
-    <!-- Form création -->
-    <div class="panel">
-      <h3>Créer un nouveau post</h3>
-      <div class="form">
-        <input v-model="newPost.title" placeholder="Titre" />
-        <input v-model="newPost.author" placeholder="Auteur" />
-        <textarea v-model="newPost.content" rows="5" placeholder="Contenu"></textarea>
-        <div class="form-actions">
-          <button @click="createPost">Publier (localement)</button>
+      <div
+        v-if="post.comments && post.comments.length > 0 && post.comments[0]"
+        class="first-comment"
+      >
+        <div class="comment-item">
+          <div style="display: flex; justify-content: space-between; align-items: start">
+            <div>
+              <strong>{{ post.comments[0]?.author }}:</strong> {{ post.comments[0]?.content }}
+              <br />
+              <small style="color: var(--muted)">{{ post.comments[0]?.date }}</small>
+            </div>
+            <div>
+              <button
+                style="padding: 2px 5px; font-size: 0.7rem; margin-right: 5px"
+                @click="post.comments[0] && updateComment(post, post.comments[0].id)"
+              >
+                Modifier
+              </button>
+              <button
+                style="padding: 2px 5px; font-size: 0.7rem; background: var(--error)"
+                @click="post.comments[0] && deleteComment(post, post.comments[0].id)"
+              >
+                Supprimer
+              </button>
+            </div>
+          </div>
         </div>
+      </div>
+
+      <div v-if="post.comments && post.comments.length > 0" style="margin-top: 10px">
+        <a
+          href="#"
+          @click.prevent="toggleComments(post)"
+          style="color: var(--accent); text-decoration: none; font-weight: 600"
+        >
+          {{ post.showComments ? '▼ Masquer' : '▶ Voir tous' }} les commentaires ({{
+            post.comments.length
+          }})
+        </a>
+
+        <div v-if="post.showComments" class="comments">
+          <ul>
+            <li v-for="(c, index) in post.comments.slice(1)" :key="c.id">
+              <div style="display: flex; justify-content: space-between; align-items: start">
+                <div>
+                  <strong>{{ c.author }}:</strong> {{ c.content }}
+                  <br />
+                  <small style="color: var(--muted)">{{ c.date }}</small>
+                </div>
+                <div>
+                  <button
+                    style="padding: 2px 5px; font-size: 0.7rem; margin-right: 5px"
+                    @click="updateComment(post, c.id)"
+                  >
+                    Modifier
+                  </button>
+                  <button
+                    style="padding: 2px 5px; font-size: 0.7rem; background: var(--error)"
+                    @click="deleteComment(post, c.id)"
+                  >
+                    Supprimer
+                  </button>
+                </div>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </div>
+
+      <div v-else style="margin-top: 10px; color: var(--muted); font-size: 0.9rem">
+        Aucun commentaire pour le moment
       </div>
     </div>
   </div>
@@ -510,6 +569,8 @@ button:disabled {
   display: flex;
   gap: 0.5rem;
   align-items: center;
+  width: 100%;
+  margin-top: 10px;
 }
 .search-row input {
   flex: 1;
@@ -557,20 +618,29 @@ button:disabled {
   background: #64748b;
 }
 
+.first-comment {
+  margin-top: 15px;
+  padding: 10px;
+  background: rgba(59, 130, 246, 0.1);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+}
+
+.comment-item {
+  font-size: 0.95rem;
+}
+
 .comments {
   margin-top: 0.5rem;
   padding-left: 1rem;
+  border-top: 1px solid #334155;
+  padding-top: 10px;
 }
 .comments li {
-  margin-bottom: 0.25rem;
+  margin-bottom: 0.5rem;
   font-size: 0.95rem;
-}
-.comments button {
-  margin-left: 0.5rem;
-  background: #ef4444;
-  padding: 0.1rem 0.4rem;
-  border-radius: 4px;
-  font-size: 0.8rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  padding-bottom: 5px;
 }
 
 .form {
@@ -615,6 +685,37 @@ button:disabled {
   color: var(--muted);
 }
 
+.conflict-banner {
+  background: #7f1d1d;
+  padding: 12px;
+  margin-bottom: 12px;
+  border-radius: 6px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border: 2px solid #ef4444;
+}
+
+.conflict-banner strong {
+  color: #fca5a5;
+  font-size: 1rem;
+}
+
+.conflict-banner span {
+  color: #fecaca;
+}
+
+.resolve-btn {
+  background: #ef4444 !important;
+  padding: 8px 16px !important;
+  font-size: 0.9rem !important;
+  white-space: nowrap;
+}
+
+.resolve-btn:hover {
+  background: #dc2626 !important;
+}
+
 @media (max-width: 640px) {
   .controls {
     flex-direction: column;
@@ -623,6 +724,11 @@ button:disabled {
     flex-direction: column;
     align-items: flex-start;
     gap: 0.25rem;
+  }
+  .conflict-banner {
+    flex-direction: column;
+    gap: 10px;
+    align-items: stretch;
   }
 }
 </style>
