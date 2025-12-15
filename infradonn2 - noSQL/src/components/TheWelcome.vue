@@ -7,10 +7,14 @@ PouchDB.plugin(PouchDBFind)
 
 // --- TYPES ---
 interface Comment {
-  id: string
+  _id?: string
+  _rev?: string
+  type: string
+  postId: string
   author: string
   content: string
   date: string
+  _conflicts?: string[]
 }
 
 interface Post {
@@ -22,8 +26,8 @@ interface Post {
   content: string
   likes: number
   date: string
-  comments: Comment[]
   _conflicts?: string[]
+  comments?: Comment[]
   showComments?: boolean
 }
 
@@ -39,7 +43,7 @@ const syncHandler = ref<any>(null)
 
 // Recherche & Tri
 const searchQuery = ref('')
-const sortType = ref<'date' | 'likes'>('likes') // Par défaut: top 10 likés
+const sortType = ref<'date' | 'likes'>('likes')
 const sortDirection = ref<'asc' | 'desc'>('desc')
 
 // Form
@@ -53,6 +57,9 @@ onMounted(async () => {
   try {
     await localDB.value.createIndex({
       index: { fields: ['likes'] },
+    })
+    await localDB.value.createIndex({
+      index: { fields: ['postId'] },
     })
   } catch (e) {
     console.error('Erreur Index', e)
@@ -103,6 +110,8 @@ const fetchData = async () => {
   if (!localDB.value) return
 
   try {
+    let postsList: Post[] = []
+
     if (sortType.value === 'likes') {
       const selector: any = {
         type: 'post',
@@ -120,10 +129,7 @@ const fetchData = async () => {
         conflicts: true,
       })
 
-      posts.value = result.docs.map((d: Post) => {
-        const existing = posts.value.find((p) => p._id === d._id)
-        return { ...d, showComments: existing ? existing.showComments : false }
-      })
+      postsList = result.docs
     } else {
       const result = await localDB.value.allDocs({
         include_docs: true,
@@ -142,13 +148,36 @@ const fetchData = async () => {
         docs = docs.filter((doc: any) => regex.test(doc.title))
       }
 
-      posts.value = docs.map((d: Post) => {
-        const existing = posts.value.find((p) => p._id === d._id)
-        return { ...d, showComments: existing ? existing.showComments : false }
-      })
+      postsList = docs
     }
+
+    for (const post of postsList) {
+      const comments = await fetchCommentsForPost(post._id!)
+      post.comments = comments
+
+      const existing = posts.value.find((p) => p._id === post._id)
+      post.showComments = existing ? existing.showComments : false
+    }
+
+    posts.value = postsList
   } catch (e) {
     console.error('Erreur Find', e)
+  }
+}
+
+const fetchCommentsForPost = async (postId: string): Promise<Comment[]> => {
+  try {
+    const result = await localDB.value.find({
+      selector: {
+        type: 'comment',
+        postId: postId,
+      },
+      conflicts: true,
+    })
+    return result.docs
+  } catch (e) {
+    console.error('Erreur récupération commentaires:', e)
+    return []
   }
 }
 
@@ -163,7 +192,7 @@ const resolveConflict = async (post: Post) => {
     const versionDistante = await localDB.value.get(post._id, { rev: conflictRev })
 
     const choice = confirm(
-      `⚠️ CONFLIT DÉTECTÉ\n\n` +
+      `CONFLIT DÉTECTÉ\n\n` +
         `Deux versions différentes existent pour "${post.title}":\n\n` +
         `VERSION 1 (Locale):\n` +
         `${post.content.substring(0, 100)}...\n` +
@@ -187,7 +216,6 @@ const resolveConflict = async (post: Post) => {
         content: versionDistante.content,
         author: versionDistante.author,
         likes: versionDistante.likes,
-        comments: versionDistante.comments,
         date: versionDistante.date,
       }
 
@@ -205,6 +233,44 @@ const resolveConflict = async (post: Post) => {
   }
 }
 
+const resolveCommentConflict = async (comment: Comment) => {
+  if (!comment._conflicts || comment._conflicts.length === 0) return
+
+  try {
+    const conflictRev = comment._conflicts[0]
+    const versionDistante = await localDB.value.get(comment._id, { rev: conflictRev })
+
+    const choice = confirm(
+      `CONFLIT COMMENTAIRE\n\n` +
+        `VERSION 1 (Locale):\n` +
+        `${comment.content}\n\n` +
+        `VERSION 2 (Distante):\n` +
+        `${versionDistante.content}\n\n` +
+        `OK = Garder Version 1 (Locale)\n` +
+        `ANNULER = Garder Version 2 (Distante)`,
+    )
+
+    if (choice) {
+      await localDB.value.remove(comment._id, conflictRev)
+    } else {
+      const versionLocale = await localDB.value.get(comment._id)
+      const nouvelleVersion = {
+        ...versionLocale,
+        author: versionDistante.author,
+        content: versionDistante.content,
+        date: versionDistante.date,
+      }
+      await localDB.value.put(nouvelleVersion)
+      await localDB.value.remove(comment._id, conflictRev)
+    }
+
+    await fetchData()
+  } catch (e) {
+    console.error('Erreur résolution conflit commentaire:', e)
+    alert('Erreur lors de la résolution du conflit')
+  }
+}
+
 // --- CRUD POSTS ---
 const createPost = async () => {
   if (!newPost.value.title || !newPost.value.author) return alert('Champs requis')
@@ -217,7 +283,6 @@ const createPost = async () => {
     content: newPost.value.content,
     likes: 0,
     date: new Date().toLocaleString(),
-    comments: [],
   }
 
   try {
@@ -238,9 +303,18 @@ const updatePost = async (post: Post) => {
 }
 
 const deletePost = async (post: Post) => {
-  if (confirm('Supprimer ce post ?')) {
-    const doc = await localDB.value.get(post._id)
-    await localDB.value.remove(doc)
+  if (confirm('Supprimer ce post et tous ses commentaires ?')) {
+    try {
+      const doc = await localDB.value.get(post._id)
+      await localDB.value.remove(doc)
+
+      const comments = await fetchCommentsForPost(post._id!)
+      for (const comment of comments) {
+        await localDB.value.remove(comment._id, comment._rev)
+      }
+    } catch (e) {
+      console.error('Erreur suppression:', e)
+    }
   }
 }
 
@@ -257,36 +331,46 @@ const addComment = async (post: Post) => {
   const content = prompt('Commentaire :')
   if (!content) return
 
-  const doc = await localDB.value.get(post._id)
-  doc.comments.push({
-    id: Date.now().toString(),
+  const commentDoc: Comment = {
+    _id: `comment_${Date.now()}`,
+    type: 'comment',
+    postId: post._id!,
     author,
     content,
     date: new Date().toLocaleTimeString(),
-  })
-  await localDB.value.put(doc)
+  }
 
-  const p = posts.value.find((x) => x._id === post._id)
-  if (p) p.showComments = true
-}
+  try {
+    await localDB.value.put(commentDoc)
 
-const updateComment = async (post: Post, commentId: string) => {
-  const doc = await localDB.value.get(post._id)
-  const c = doc.comments.find((x: Comment) => x.id === commentId)
-  if (c) {
-    const newTxt = prompt('Modifier commentaire :', c.content)
-    if (newTxt !== null) {
-      c.content = newTxt
-      await localDB.value.put(doc)
-    }
+    const p = posts.value.find((x) => x._id === post._id)
+    if (p) p.showComments = true
+  } catch (e) {
+    console.error('Erreur ajout commentaire:', e)
   }
 }
 
-const deleteComment = async (post: Post, commentId: string) => {
+const updateComment = async (comment: Comment) => {
+  try {
+    const doc = await localDB.value.get(comment._id)
+    const newTxt = prompt('Modifier commentaire :', doc.content)
+    if (newTxt !== null) {
+      doc.content = newTxt
+      await localDB.value.put(doc)
+    }
+  } catch (e) {
+    console.error('Erreur modification commentaire:', e)
+  }
+}
+
+const deleteComment = async (comment: Comment) => {
   if (confirm('Supprimer ce commentaire ?')) {
-    const doc = await localDB.value.get(post._id)
-    doc.comments = doc.comments.filter((x: Comment) => x.id !== commentId)
-    await localDB.value.put(doc)
+    try {
+      const doc = await localDB.value.get(comment._id)
+      await localDB.value.remove(doc)
+    } catch (e) {
+      console.error('Erreur suppression commentaire:', e)
+    }
   }
 }
 
@@ -297,18 +381,33 @@ const toggleComments = (post: Post) => {
 // --- FACTORY ---
 const runFactory = async () => {
   const docs = []
+  const timestamp = Date.now()
+
   for (let i = 0; i < 10; i++) {
+    const postId = `post_${timestamp + i}`
     docs.push({
-      _id: `post_${Date.now() + i}`,
+      _id: postId,
       type: 'post',
       title: `Article Généré ${i}`,
       author: 'Bot Factory',
       content: 'Contenu de test généré automatiquement.',
       likes: Math.floor(Math.random() * 100),
       date: new Date().toLocaleString(),
-      comments: [],
     })
+
+    const numComments = Math.floor(Math.random() * 3) + 1
+    for (let j = 0; j < numComments; j++) {
+      docs.push({
+        _id: `comment_${timestamp + i}_${j}`,
+        type: 'comment',
+        postId: postId,
+        author: `User${j + 1}`,
+        content: `Commentaire test ${j + 1} pour l'article ${i}`,
+        date: new Date().toLocaleTimeString(),
+      })
+    }
   }
+
   await localDB.value.bulkDocs(docs)
 }
 </script>
@@ -367,9 +466,9 @@ const runFactory = async () => {
     <div v-for="post in posts" :key="post._id" class="post">
       <div v-if="post._conflicts && post._conflicts.length > 0" class="conflict-banner">
         <div>
-          <strong>Conflit !</strong>
+          <strong>Conflit Post !</strong>
           <span style="font-size: 0.9rem; margin-left: 10px">
-            Ce document a été modifié en même temps à deux endroits
+            Ce post a été modifié en même temps à deux endroits
           </span>
         </div>
         <button @click="resolveConflict(post)" class="resolve-btn">Résoudre</button>
@@ -396,6 +495,19 @@ const runFactory = async () => {
         v-if="post.comments && post.comments.length > 0 && post.comments[0]"
         class="first-comment"
       >
+        <div
+          v-if="post.comments[0]._conflicts && post.comments[0]._conflicts.length > 0"
+          class="conflict-banner-small"
+        >
+          <strong>Conflit commentaire</strong>
+          <button
+            style="padding: 2px 8px; font-size: 0.75rem"
+            @click="resolveCommentConflict(post.comments[0])"
+          >
+            Résoudre
+          </button>
+        </div>
+
         <div class="comment-item">
           <div style="display: flex; justify-content: space-between; align-items: start">
             <div>
@@ -406,13 +518,13 @@ const runFactory = async () => {
             <div>
               <button
                 style="padding: 2px 5px; font-size: 0.7rem; margin-right: 5px"
-                @click="post.comments[0] && updateComment(post, post.comments[0].id)"
+                @click="post.comments[0] && updateComment(post.comments[0])"
               >
                 Modifier
               </button>
               <button
                 style="padding: 2px 5px; font-size: 0.7rem; background: var(--error)"
-                @click="post.comments[0] && deleteComment(post, post.comments[0].id)"
+                @click="post.comments[0] && deleteComment(post.comments[0])"
               >
                 Supprimer
               </button>
@@ -434,7 +546,17 @@ const runFactory = async () => {
 
         <div v-if="post.showComments" class="comments">
           <ul>
-            <li v-for="(c, index) in post.comments.slice(1)" :key="c.id">
+            <li v-for="c in post.comments.slice(1)" :key="c._id">
+              <div v-if="c._conflicts && c._conflicts.length > 0" class="conflict-banner-small">
+                <strong>Conflit</strong>
+                <button
+                  style="padding: 2px 8px; font-size: 0.75rem"
+                  @click="resolveCommentConflict(c)"
+                >
+                  Résoudre
+                </button>
+              </div>
+
               <div style="display: flex; justify-content: space-between; align-items: start">
                 <div>
                   <strong>{{ c.author }}:</strong> {{ c.content }}
@@ -444,13 +566,13 @@ const runFactory = async () => {
                 <div>
                   <button
                     style="padding: 2px 5px; font-size: 0.7rem; margin-right: 5px"
-                    @click="updateComment(post, c.id)"
+                    @click="updateComment(c)"
                   >
                     Modifier
                   </button>
                   <button
                     style="padding: 2px 5px; font-size: 0.7rem; background: var(--error)"
-                    @click="deleteComment(post, c.id)"
+                    @click="deleteComment(c)"
                   >
                     Supprimer
                   </button>
@@ -703,6 +825,22 @@ button:disabled {
 
 .conflict-banner span {
   color: #fecaca;
+}
+
+.conflict-banner-small {
+  background: #7f1d1d;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  border-radius: 4px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border: 1px solid #ef4444;
+  font-size: 0.85rem;
+}
+
+.conflict-banner-small strong {
+  color: #fca5a5;
 }
 
 .resolve-btn {
